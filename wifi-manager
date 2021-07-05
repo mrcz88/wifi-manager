@@ -1,0 +1,249 @@
+#!/bin/bash
+
+
+defdev=wlp2s0
+defdev=$(ip link | egrep -o 'wlp[^:]+')
+
+if [ -z "$defdev" ]; then
+   echo "cannot find wireless device"
+fi
+
+scriptdir="$(dirname $(readlink -f "$0"))"
+forceterm=no
+autoclean1=""
+autoclean2=""
+
+cleanup() {
+   if [ "$debug" ==  "yes" ]; then
+      return
+   fi
+   echo cleanup
+   [ -e "$autoclean1" ] && [[ "$autoclean1" =~ ^/tmp/[^/]+$ ]] &&  
+   run rm -rf "$autoclean1"
+   [ -e "$autoclean2" ] && [[ "$autoclean2" =~ ^/tmp/[^/]+$ ]] &&  
+   run rm -rf "$autoclean2"
+}
+
+fail_cleanup() {
+   echo "fail_cleanup"
+   kill_by_dev "$defdev"
+   exit 1
+}
+
+trap 'cleanup' 0
+trap 'fail_cleanup' SIGTERM SIGABRT SIGTRAP SIGKILL SIGINT
+
+function run() {
+    echo "$@" >/dev/tty
+    "$@"
+}
+
+function kill_prev() {
+    while [ -n "$(pidof dhclient)" -o\
+            -n "$(pidof wpa_supplicant)" -o\
+            -n "$(pidof dhcpcd)" ]; do
+      run sudo killall wpa_supplicant
+      run sudo killall dhclient
+      run sudo killall dhcpcd
+      sleep 5
+    done
+}
+
+function kill_by_dev() {
+    if $(ps -ef | egrep -iq 'wpa_supplicant.*'"$1"); then
+	echo "found wpa_supplicant for $1"
+    fi
+    echo "killing wpa_supplicant/dhclient/dhcpcd for $1"
+    pids="$(ps -ef | grep -E '(dhclient|wpa_supplicant|dhcpcd).*'$1 |\
+tr -s ' ' | cut -f2 -d' ')"
+    [ -n "$pids" ] && while sudo kill $pids || [ $? -eq 64 ]; do sleep 1; done
+}
+
+function change_2() {
+    tmpdir=$(mktemp -t -d 'wifi-choose.XXX')
+    autoclean2="$tmpdir"
+    pipe=$tmpdir/wpa.pipe
+    mknod $pipe p
+    dev="$1"
+    conf="$2"    
+    kill_by_dev "$dev"
+    run sudo ip link set "$dev" up
+    exec 7<>$pipe
+    #run sudo wpa_supplicant -D wext,nl80211 -i "$dev" -c "$conf" -f "$pipe" &
+    run sudo wpa_supplicant -i "$dev" -c "$conf" -f "$pipe" &
+    while read -r -t 60 -u 7 line ; do
+        echo "$line"
+        if [[ "$line" =~ .*CTRL-EVENT-CONNECTED.* ]]; then
+            ( command -v dhclient >/dev/null && run sudo dhclient "$dev" ) ||
+            run sudo dhcpcd "$dev"
+            run ip addr show "$dev"
+            break;
+        elif [[ "$line" =~ .*CTRL-EVENT-TERMINATING.* ]]; then
+            echo "CTRL-EVENT-TERMINATING...." >&2
+            break;
+
+        elif [[ "$line" =~ .*CTRL-EVENT-DISCONNECTED.* ]]; then
+            echo "CTRL-EVENT-DISCONNECTED...." >&2
+            break;
+        fi
+    done
+    exec 7<&-
+}
+
+
+
+function list-confs() {
+    find  . -maxdepth 1 -type f -not -name '.bash_history'\
+    -exec grep -q 'network={' '{}' \; -print
+    find "$scriptdir"  -maxdepth 1 -type f -not -name '.bash_history'\
+    -exec grep -q 'network={' '{}' \; -print
+}
+
+function choose_conf_interactive() {
+    tmpfile=$(mktemp -t "wifi-choose.XXX")
+    exec 8<>"$tmpfile"	
+    if [ "$forceterm" == no ] && [ -n "$DISPLAY" ] && command -v /usr/bin/dmenu >/dev/null; then
+        list-confs | /usr/bin/dmenu >"$tmpfile"
+    else 
+        select file in $(list-confs); do echo "$file">"$tmpfile"; break; done
+    fi
+    read -d'$\n' -u 8 conf
+    # close file descriptor
+    exec 8<&-
+    rm "$tmpfile"
+    echo "$conf"
+}
+
+function list_wifi() {
+    run sudo ip link set "$defdev" up
+    run sudo iw dev "$defdev" scan ap-force | perl -ne 'print "$1\n" if /SSID\s*:\s*(\w+)\s*/'
+}
+
+
+function choose_net_interactive() {
+    tmpfile=$(mktemp -t "wifi-choose.XXX")
+    exec 8<>"$tmpfile"	
+    if [ "$forceterm" == no ] && [ -n "$DISPLAY" ] && command -v /usr/bin/dmenu >/dev/null; then
+        list_wifi | /usr/bin/dmenu >"$tmpfile"
+    else 
+        select file in $(list_wifi); do echo "$file">"$tmpfile"; break; done
+    fi
+    read -d'$\n' -u 8 conf
+    # close file descriptor
+    exec 8<&-
+    rm "$tmpfile"
+    echo "$conf"
+}
+
+function usage() {
+    prgname="$(basename $(readlink -f "$0"))"
+    cat <<END
+usage: $prgname [options]
+    -s
+        choose network from terminal
+    -d
+        choose network from dmenu
+    -f wpa-conf-file
+        use the network configured in the file
+    -a  with -f autoconnect to the network as soon as it is available
+    -q  kill all wpa_supplicant and dhcp clients
+END
+}
+
+
+function networkfile() {
+    local ssid="$1"
+    local psw="$2"
+    local file="$(mktemp -t wifi-choose-file.XXX)"
+(
+cat <<END
+ap_scan=1
+network={
+ssid="SSID"
+scan_ssid=1
+key_mgmt=WPA-PSK
+psk="PSW"
+}
+END
+) | sed "s/SSID/$1/" | sed "s/PSW/$2/" >"$file"
+    echo "$file"    
+}
+
+function readcmdline2() {
+    while getopts ":sdf:qaD" arg; do
+      case $arg in
+        D) # debug
+          debug=yes
+          ;;
+        s) # Specify p value.
+          forceterm=yes
+          ;;
+        d)
+          #strength=${OPTARG}
+          forceterm=no   
+          ;;
+        f)
+          wpa_conf=${OPTARG}
+          forceterm=no    
+          ;;
+        q)
+          shutdown_supplicant=on
+          ;;
+        a)
+          auto_connect=on
+          ;;
+        h | *) # Display help.
+          usage
+          exit 0
+          ;;
+      esac
+   done
+}
+
+
+readcmdline2 "$@"
+
+
+kill_by_dev "$defdev"
+if [ -n "$shutdown_supplicant" ]; then
+    exit 0
+fi
+
+if [ -n "$wpa_conf" ]; then
+    if [ "$auto_connect" == "on" ]; then
+        ssid=$(cat "$wpa_conf" | perl -ne 'print "$1\n" if /ssid="([^"]*)"/')
+        if [ -z "$ssid" ]; then
+            echo "error in file $wpa_conf" >&2
+            exit 1
+        fi
+	echo "waiting for network $ssid to popup"
+        while true; do
+            if list_wifi | grep -q "$ssid"; then
+                echo "network found!! connecting...."
+                sleep 1
+                change_2 "$defdev" "$wpa_conf"
+                break
+            fi
+            sleep 4
+        done
+    else
+        change_2 "$defdev" "$wpa_conf"
+    fi
+    exit 0
+fi
+
+# scelgo rete/ssid interattivamente
+net=$(choose_net_interactive)
+if [ -n "$net" ]; then
+    read -p 'password for '\"$net\" psk
+    echo "Creating config file for "\"$net\"
+    conf=$(networkfile "$net" "$psk") 
+    echo "Created at $conf"':'
+    cat "$conf"
+    autoclean1="$conf"
+    if [ -n "$conf" ]; then
+        change_2 "$defdev" "$conf";
+    fi
+fi
+
+
